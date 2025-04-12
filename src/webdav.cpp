@@ -121,31 +121,105 @@ void rfs::WebDav::downloadFile(const std::string& _fileID, curlFuncs::curlDlArgs
     //Downloading is threaded because it's too slow otherwise
     dlWriteThreadStruct dlWrite;
     dlWrite.cfa = _download;
-
+    dlWrite.error = false;
+    dlWrite.completed = false;
+    dlWrite.abort = false;
+    
+    // 首先检查文件是否存在，并获取大小信息
+    CURL* head_curl = curl_easy_duphandle(curl);
+    std::string fullUrl = origin + _fileID;
+    long fileSize = 0;
+    
+    // 使用HEAD请求获取文件大小
+    curl_easy_setopt(head_curl, CURLOPT_URL, fullUrl.c_str());
+    curl_easy_setopt(head_curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(head_curl, CURLOPT_HEADER, 1L);
+    
+    CURLcode headRes = curl_easy_perform(head_curl);
+    if(headRes == CURLE_OK) {
+        curl_easy_getinfo(head_curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &fileSize);
+        
+        if(fileSize > 0) {
+            _download->size = fileSize;
+            fs::logWrite("WebDav: 检测到文件大小: %ld 字节\n", fileSize);
+        } else {
+            fs::logWrite("WebDav: 无法获取文件大小，将使用动态下载模式\n");
+            _download->size = 0; // 将使用动态大小
+        }
+    } else {
+        fs::logWrite("WebDav: 获取文件信息失败: %s\n", curl_easy_strerror(headRes));
+    }
+    curl_easy_cleanup(head_curl);
+    
+    // 创建下载线程
     Thread writeThread;
     threadCreate(&writeThread, writeThread_t, &dlWrite, NULL, 0x8000, 0x2B, 2);
 
-
     CURL* local_curl = curl_easy_duphandle(curl);
 
-    std::string fullUrl = origin + _fileID;
     curl_easy_setopt(local_curl, CURLOPT_URL, fullUrl.c_str());
     curl_easy_setopt(local_curl, CURLOPT_WRITEFUNCTION, writeDataBufferThreaded);
     curl_easy_setopt(local_curl, CURLOPT_WRITEDATA, &dlWrite);
+    curl_easy_setopt(local_curl, CURLOPT_CONNECTTIMEOUT, 30L); // 连接超时时间
+    curl_easy_setopt(local_curl, CURLOPT_TIMEOUT, 0L);         // 不设置传输超时，允许长时间传输
+    curl_easy_setopt(local_curl, CURLOPT_LOW_SPEED_LIMIT, 1L); // 设置最低速度限制
+    curl_easy_setopt(local_curl, CURLOPT_LOW_SPEED_TIME, 30L); // 低于限制速度的时间超过30秒则中止
+    
     threadStart(&writeThread);
 
     CURLcode res = curl_easy_perform(local_curl);
 
-    // Copied from gd.cpp implementation.
-    // TODO: Not sure how a thread helps if this parent waits here.
-    threadWaitForExit(&writeThread);
-    threadClose(&writeThread);
-
+    // 检查执行结果
     if(res != CURLE_OK) {
-        fs::logWrite("WebDav: file download failed: %s\n", curl_easy_strerror(res));
+        fs::logWrite("WebDav: 文件下载失败: %s\n", curl_easy_strerror(res));
+        
+        // 通知写入线程终止
+        {
+            std::unique_lock<std::mutex> lock(dlWrite.dataLock);
+            dlWrite.abort = true;
+            dlWrite.error = true;
+            lock.unlock();
+            dlWrite.cond.notify_one();
+        }
+    } else {
+        // 下载完成
+        std::unique_lock<std::mutex> lock(dlWrite.dataLock);
+        dlWrite.completed = true;
+        // 如果还有剩余数据，确保通知写入线程
+        if(!rfs::downloadBuffer.empty()) {
+            dlWrite.sharedBuffer.assign(rfs::downloadBuffer.begin(), rfs::downloadBuffer.end());
+            rfs::downloadBuffer.clear();
+            dlWrite.bufferFull = true;
+        }
+        lock.unlock();
+        dlWrite.cond.notify_one();
     }
-
+    
+    // 等待写入线程结束，最多等待10秒
+    bool thread_exited = false;
+    for(int i = 0; i < 10; i++) {
+        if(threadWaitForExit(&writeThread) == 0) {
+            thread_exited = true;
+            break;
+        }
+        fs::logWrite("WebDav: 等待写入线程结束，尝试 %d/10\n", i+1);
+        // 休眠一秒
+        svcSleepThread(1000000000ULL);
+    }
+    
+    if(!thread_exited) {
+        fs::logWrite("WebDav: 写入线程未能正常退出，强制结束\n");
+    }
+    
+    threadClose(&writeThread);
     curl_easy_cleanup(local_curl);
+    
+    // 处理错误状态
+    if(dlWrite.error) {
+        fs::logWrite("WebDav: 由于错误，下载未完成\n");
+    } else if(res != CURLE_OK) {
+        fs::logWrite("WebDav: 下载失败: %s\n", curl_easy_strerror(res));
+    }
 }
 void rfs::WebDav::deleteFile(const std::string& _fileID) {
     CURL* local_curl = curl_easy_duphandle(curl);

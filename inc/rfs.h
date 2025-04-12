@@ -3,6 +3,7 @@
 #include <string>
 #include "curlfuncs.h"
 #include <mutex>
+#include <condition_variable>
 
 #define UPLOAD_BUFFER_SIZE 0x8000
 #define DOWNLOAD_BUFFER_SIZE 0xC00000
@@ -45,6 +46,9 @@ namespace rfs {
         std::vector<uint8_t> sharedBuffer;
         bool bufferFull = false;
         unsigned int downloaded = 0;
+        bool error = false;       // 错误标志
+        bool completed = false;   // 完成标志
+        bool abort = false;       // 终止标志
     } dlWriteThreadStruct;
 
     extern std::vector<uint8_t> downloadBuffer;
